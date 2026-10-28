@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <title>ちょい撮り</title>
 <meta name="description" content="PC画面などを無音で一時的に撮って、すぐ見て、すぐ消すためのカメラ">
+<meta name="robots" content="noindex, nofollow">
 <meta name="theme-color" content="#0b0d10">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -71,10 +72,11 @@ video { width: 100%; height: 100%; object-fit: cover; display: block; }
 .controls { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; }
 .controls .left { justify-self: start; }
 .controls .right { justify-self: end; }
-.shutter { width: 72px; height: 72px; border-radius: 50%; border: 4px solid var(--fg); display: grid; place-items: center; }
+.shutter { width: 72px; height: 72px; padding: 0; border-radius: 50%; border: 4px solid var(--fg); display: grid; place-items: center; }
 .shutter::after { content: ""; width: 56px; height: 56px; border-radius: 50%; background: var(--fg); transition: transform 90ms; }
 .shutter:active::after { transform: scale(.88); }
 .shutter:disabled { opacity: .35; }
+.shutter.busy::after { transform: scale(.7); opacity: .6; }
 .ghost { padding: 8px 10px; border-radius: 10px; color: var(--muted); font-size: 13px; }
 .ghost.danger { color: var(--danger); }
 .ghost:disabled { opacity: .35; }
@@ -198,6 +200,7 @@ video { width: 100%; height: 100%; object-fit: cover; display: block; }
       await video.play().catch(() => {});
       notice.hidden = true;
       shutter.disabled = false;
+      setupFocus();
       setupZoom();
       keepAwake();
     } catch (e) {
@@ -232,6 +235,12 @@ video { width: 100%; height: 100%; object-fit: cover; display: block; }
   });
   let resumeOnReturn = false;
 
+  // 近くの画面にピントが合い続けるように（対応端末のみ。主にAndroid）
+  function setupFocus() {
+    const modes = track?.getCapabilities?.().focusMode;
+    if (modes?.includes("continuous")) track.applyConstraints({ advanced: [{ focusMode: "continuous" }] }).catch(() => {});
+  }
+
   // 光学/デジタルズーム（対応端末のみ）
   function setupZoom() {
     const box = $("zoom");
@@ -258,20 +267,67 @@ video { width: 100%; height: 100%; object-fit: cover; display: block; }
   }
 
   // ---------- 撮影（動画の1コマを切り出すので無音） ----------
+  // 手ブレ対策：押した直後の揺れを少し待ってから約0.5秒ぶんのコマを集め、いちばんくっきりした1枚を残す
+  const SETTLE_MS = 120, BURST_MS = 480;
+  const probe = document.createElement("canvas");
+  const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+  const nextFrame = () => new Promise((r) =>
+    video.requestVideoFrameCallback ? video.requestVideoFrameCallback(() => r()) : requestAnimationFrame(() => r()));
+
+  // 中央部分を縮小してラプラシアンの分散を取る（大きいほどシャープ）
+  function sharpness() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const cw = vw * 0.6, ch = vh * 0.6;
+    const pw = 320, ph = Math.round(320 * ch / cw);
+    probe.width = pw; probe.height = ph;
+    probeCtx.drawImage(video, (vw - cw) / 2, (vh - ch) / 2, cw, ch, 0, 0, pw, ph);
+    const d = probeCtx.getImageData(0, 0, pw, ph).data;
+    const g = new Float32Array(pw * ph);
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = d[j] * 0.299 + d[j + 1] * 0.587 + d[j + 2] * 0.114;
+    let sum = 0, sq = 0, n = 0;
+    for (let y = 1; y < ph - 1; y++) {
+      for (let x = 1; x < pw - 1; x++) {
+        const i = y * pw + x;
+        const l = g[i - 1] + g[i + 1] + g[i - pw] + g[i + pw] - 4 * g[i];
+        sum += l; sq += l * l; n++;
+      }
+    }
+    const m = sum / n;
+    return sq / n - m * m;
+  }
+
+  let busy = false;
   async function capture() {
-    if (!stream || !video.videoWidth) return;
-    const w = video.videoWidth, h = video.videoHeight;
-    const c = document.createElement("canvas");
-    c.width = w; c.height = h;
-    c.getContext("2d").drawImage(video, 0, 0, w, h);
+    if (busy || !stream || !video.videoWidth) return;
+    busy = true;
+    shutter.classList.add("busy");
     const flash = $("flash");
     flash.classList.remove("on"); void flash.offsetWidth; flash.classList.add("on");
-    navigator.vibrate?.(15);
-    const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
-    if (!blob) return;
-    shots.push({ id: ++seq, url: URL.createObjectURL(blob), w, h, at: Date.now() });
-    enforceLimits();
-    render(seq);
+    try {
+      const w = video.videoWidth, h = video.videoHeight;
+      const c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      const ctx = c.getContext("2d");
+      let best = -1;
+      await new Promise((r) => setTimeout(r, SETTLE_MS));
+      const end = performance.now() + BURST_MS;
+      do {
+        await nextFrame();
+        if (!stream || video.videoWidth !== w) break;
+        const s = sharpness();
+        if (s > best) { best = s; ctx.drawImage(video, 0, 0, w, h); }
+      } while (performance.now() < end);
+      if (best < 0) return;
+      navigator.vibrate?.(15); // 振動もブレの原因になるので撮り終えてから
+      const blob = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
+      if (!blob) return;
+      shots.push({ id: ++seq, url: URL.createObjectURL(blob), w, h, at: Date.now() });
+      enforceLimits();
+      render(seq);
+    } finally {
+      busy = false;
+      shutter.classList.remove("busy");
+    }
   }
   shutter.addEventListener("click", capture);
   // 音量ボタンは使えないので、キーボードのスペース/Enterでも撮れるように
